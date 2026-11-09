@@ -1,12 +1,17 @@
-"""双轴云台多圈直通位置、平滑轨迹与保持示例；必须显式添加 --confirm。
+"""双轴云台多圈位置、平滑轨迹与保持示例；必须显式添加 --confirm。
 
+直通模式（默认）：Python 用 smoothstep 周期发送位置目标。
 示例：python examples/two_axis_abs_pos.py --port COM8 \
           --yaw-delta 5 --pitch-delta 5 --speed 50 --move-time 3 --hold-time 0 --confirm
+
+规划模式（--planned）：电机内部生成轨迹，稳定后最终目标只发送一次。
+示例：python examples/two_axis_abs_pos.py --port COM8 \
+          --yaw-delta 5 --pitch-delta 5 --speed 50 --planned --hold-time 0 --confirm
 
 最终目标 = calibration.json 中的标定参考角度 + 命令行增量。
 实际起点 = 本次启动时通过 read_angle() 读到的两轴多圈绝对角度。
 
---speed 是电机内部位置速度参数；--move-time 是 Python 生成平滑轨迹的时长。
+--speed 是电机内部位置速度参数；--move-time 只控制直通模式的 Python 平滑轨迹时长。
 二者相互独立：可以用较稳定的速度参数，同时让激光笔缓慢转动。
 到位后继续保持 --hold-time 秒，然后退出并尝试失能两轴；失能后机构可能下落。
 """
@@ -38,7 +43,7 @@ def smoothstep01(progress):
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="F32C 双轴平滑直通位置与保持示例")
+    parser = argparse.ArgumentParser(description="F32C 双轴多圈位置、平滑轨迹与保持示例")
     parser.add_argument("--port", required=True, help="串口，例如 COM5 或 /dev/ttyUSB0")
     parser.add_argument("--yaw-address", type=int, default=1)
     parser.add_argument("--pitch-address", type=int, default=2)
@@ -55,14 +60,19 @@ def main() -> int:
         "--move-time",
         type=float,
         default=0.0,
-        help="Python 平滑轨迹时长，单位：秒；0 表示直接发送最终目标",
+        help="直通模式的 Python 平滑轨迹时长，单位：秒；0 表示直接发送最终目标",
+    )
+    parser.add_argument(
+        "--planned",
+        action="store_true",
+        help="使用电机内部多圈位置规划模式；最终目标只发送一次，忽略 move-time",
     )
     parser.add_argument("--tolerance", type=float, default=0.3, help="到位容差，单位：度")
     parser.add_argument(
         "--timeout",
         type=float,
         default=10.0,
-        help="平滑轨迹结束后，最长等待首次到位的时间，单位：秒",
+        help="直通轨迹结束或规划目标发送后，最长等待首次到位的时间，单位：秒",
     )
     parser.add_argument("--startup-delay", type=float, default=1.5, help="上电启动等待时间")
     parser.add_argument(
@@ -81,7 +91,7 @@ def main() -> int:
         "--command-period",
         type=float,
         default=0.02,
-        help="目标位置重发周期，单位：秒，默认 0.02",
+        help="直通目标重发及主循环周期，单位：秒，默认 0.02",
     )
     parser.add_argument("--confirm", action="store_true", help="确认接线及机械安全，允许使能电机")
     args = parser.parse_args()
@@ -120,14 +130,16 @@ def main() -> int:
             print(f"标定参考：yaw={yaw_reference:.1f}°，pitch={pitch_reference:.1f}°")
             print(f"实际起点：yaw={yaw_start:.1f}°，pitch={pitch_start:.1f}°")
             print(f"最终目标：yaw={yaw_target:.1f}°，pitch={pitch_target:.1f}°")
-            print(
-                f"模式：多圈位置直通（0x0003）；内部速度参数={args.speed} RPM；"
-                f"平滑时间={args.move_time:g} 秒。"
-            )
+            selected_mode = Mode.MULTI_POSITION if args.planned else Mode.MULTI_POSITION_DIRECT
+            if args.planned:
+                motion_description = "多圈位置规划（0x0001），最终目标只发送一次"
+            else:
+                motion_description = f"多圈位置直通（0x0003），Python 平滑时间={args.move_time:g} 秒"
+            print(f"模式：{motion_description}；内部速度参数={args.speed} RPM。")
 
             # 失能状态下先设置模式和速度，并预装载真实当前位置，避免使能后沿用旧目标。
             for motor in (yaw, pitch):
-                motor.set_mode(Mode.MULTI_POSITION_DIRECT)
+                motor.set_mode(selected_mode)
                 motor.set_speed(args.speed)
             yaw.set_angle(yaw_start)
             pitch.set_angle(pitch_start)
@@ -152,36 +164,51 @@ def main() -> int:
             print(f"稳定后起点：yaw={yaw_start:.1f}°，pitch={pitch_start:.1f}°")
             time.sleep(0.1)
 
+            if args.planned:
+                # 稳定后只发送一次最终目标；之后不再用 Python 周期重发位置命令。
+                yaw.set_angle(yaw_target)
+                pitch.set_angle(pitch_target)
+                print("最终目标已发送；后续由电机内部规划，不再周期重发位置目标。")
+
+            # 规划模式的等待超时从最终目标发送后开始计算。
             trajectory_started = time.monotonic()
-            deadline = trajectory_started + args.move_time + args.timeout
+            trajectory_duration = 0.0 if args.planned else args.move_time
+            deadline = trajectory_started + trajectory_duration + args.timeout
             reached_at = None
             next_feedback = 0.0
 
             while True:
                 now = time.monotonic()
-                if args.move_time > 0:
-                    progress = (now - trajectory_started) / args.move_time
-                else:
+                if args.planned:
                     progress = 1.0
-                blend = smoothstep01(progress)
+                else:
+                    if args.move_time > 0:
+                        progress = (now - trajectory_started) / args.move_time
+                    else:
+                        progress = 1.0
+                    blend = smoothstep01(progress)
 
-                yaw_command = yaw_start + (yaw_target - yaw_start) * blend
-                pitch_command = pitch_start + (pitch_target - pitch_start) * blend
-                yaw.set_angle(yaw_command)
-                pitch.set_angle(pitch_command)
+                    yaw_command = yaw_start + (yaw_target - yaw_start) * blend
+                    pitch_command = pitch_start + (pitch_target - pitch_start) * blend
+                    yaw.set_angle(yaw_command)
+                    pitch.set_angle(pitch_command)
 
                 if now >= next_feedback:
                     yaw_now = yaw.read_angle()
                     pitch_now = pitch.read_angle()
                     now = time.monotonic()
+                    if args.planned:
+                        motion_status = "电机内部规划"
+                    else:
+                        motion_status = f"轨迹进度={min(1.0, max(0.0, progress)) * 100:.0f}%"
                     print(
                         f"当前：yaw={yaw_now:.1f}°，pitch={pitch_now:.1f}°；"
-                        f"轨迹进度={min(1.0, max(0.0, progress)) * 100:.0f}%"
+                        f"{motion_status}"
                     )
                     next_feedback = now + 0.2
 
-                    # 轨迹尚未结束时，即使中途经过最终目标，也不提前进入保持阶段。
-                    trajectory_done = progress >= 1.0
+                    # 直通轨迹尚未结束时，即使中途经过最终目标，也不提前进入保持阶段。
+                    trajectory_done = args.planned or progress >= 1.0
                     in_tolerance = (
                         trajectory_done
                         and abs(yaw_now - yaw_target) <= args.tolerance
