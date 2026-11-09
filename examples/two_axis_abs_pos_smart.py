@@ -3,8 +3,7 @@
 必须显式添加 --confirm 才会使能电机。
 
 示例：
-python examples/two_axis_abs_pos.py --port COM8 --yaw-delta 180 --pitch-delta 180 --speed 50 --move-time 1 --hold-time 0 --confirm
-
+python examples/two_axis_abs_pos_smart.py --port COM8 --yaw-delta 180 --pitch-delta 180 --speed 50 --move-time 2 --easing power --ease-power 3 --ease-peak 0.5 --hold-time 0 --confirm
 最终目标 = calibration.json 中的标定参考角度 + 命令行增量。
 实际起点 = 本次启动时通过 read_angle() 读到的两轴多圈绝对角度。
 
@@ -75,6 +74,79 @@ def smoothstep01(progress):
     u = min(1.0, max(0.0, progress))
     return u * u * (3.0 - 2.0 * u)
 
+def smootherstep01(progress):
+    """五次平滑曲线，起止速度和加速度均为 0。
+
+    s(u) = 6u⁵ - 15u⁴ + 10u³
+
+    相比三次 smoothstep：
+    - 起点和终点附近更慢；
+    - 中间阶段更快；
+    - 起止加速度过渡更平滑。
+    """
+    u = min(1.0, max(0.0, progress))
+    return u * u * u * (u * (6.0 * u - 15.0) + 10.0)
+
+
+def power_ease_in_out01(
+    progress,
+    power,
+    peak=0.5,
+):
+    """可调节峰值位置的对称/非对称缓入缓出曲线。
+
+    power：
+        曲线强度，必须大于或等于 1。
+        越大，头尾越慢、中段越快。
+
+    peak：
+        目标速度峰值所在的时间比例，范围 0～1。
+
+        peak = 0.50：前 50% 加速，后 50% 减速；
+        peak = 0.40：前 40% 加速，后 60% 减速；
+        peak = 0.35：前 35% 加速，后 65% 减速；
+        peak = 0.30：前 30% 加速，后 70% 减速。
+
+    peak = 0.5 时，与原来的 power 曲线一致。
+    """
+    if power < 1.0:
+        raise ValueError("power 必须大于或等于 1")
+
+    if not 0.0 < peak < 1.0:
+        raise ValueError("peak 必须位于 0～1 之间")
+
+    u = min(1.0, max(0.0, progress))
+
+    if u <= peak:
+        # 加速段：从 0 平滑增加到峰值。
+        return peak * (u / peak) ** power
+
+    # 减速段：从峰值平滑下降到最终目标。
+    remaining = (1.0 - u) / (1.0 - peak)
+
+    return 1.0 - (
+        (1.0 - peak) * remaining ** power
+    )
+
+
+def trajectory_blend(
+    progress,
+    easing,
+    ease_power,
+    ease_peak,
+):
+    """根据命令行选择的位置轨迹曲线计算插值系数。"""
+    if easing == "smootherstep":
+        return smootherstep01(progress)
+
+    if easing == "power":
+        return power_ease_in_out01(
+            progress=progress,
+            power=ease_power,
+            peak=ease_peak,
+        )
+
+    return smoothstep01(progress)
 
 def initialize_direct_motors(
     yaw,
@@ -201,6 +273,41 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--easing",
+        choices=(
+            "smoothstep",
+            "smootherstep",
+            "power",
+        ),
+        default="smoothstep",
+        help=(
+            "位置轨迹曲线："
+            "smoothstep 为原三次曲线；"
+            "smootherstep 为五次曲线；"
+            "power 为可调强度曲线"
+        ),
+    )
+
+    parser.add_argument(
+        "--ease-power",
+        type=float,
+        default=2.0,
+        help=(
+            "power 曲线的缓入缓出强度，"
+            "1 为匀速，2～3 为较明显，默认 2.0"
+        ),
+    )
+
+    parser.add_argument(
+        "--ease-peak",
+        type=float,
+        default=0.5,
+        help=(
+            "power 曲线目标速度峰值的时间位置；"
+            "0.5 为对称，0.35 表示前 35% 加速、后 65% 减速"
+        ),
+    )
+    parser.add_argument(
         "--tolerance",
         type=float,
         default=0.3,
@@ -285,6 +392,14 @@ def main() -> int:
             "command-period 必须大于 0"
         )
 
+    if args.ease_power < 1.0:
+        parser.error("ease-power 必须大于或等于 1")
+
+    if not 0.0 < args.ease_peak < 1.0:
+        parser.error(
+            "ease-peak 必须大于 0 且小于 1"
+        )
+
     with open(
         "calibration.json",
         "r",
@@ -352,7 +467,12 @@ def main() -> int:
                 else:
                     progress = 1.0
 
-                blend = smoothstep01(progress)
+                blend = trajectory_blend(
+                    progress=progress,
+                    easing=args.easing,
+                    ease_power=args.ease_power,
+                    ease_peak=args.ease_peak,
+                )
 
                 # 两轴共用相同的 blend，因此按相同的
                 # 归一化进度同时开始、同时结束。
