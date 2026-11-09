@@ -41,29 +41,30 @@ USB 转 TTL 模块                 F32C 电机总线
 ## 3. 安装
 
 需要 Python 3.9 或更高版本。在本目录打开终端：
+建议安装uv
 
 ### Windows
 
 ```bat
-py -m pip install -e .
+uv pip install -e .
 py examples\list_ports.py
 ```
 
 ### Linux / macOS
 
 ```bash
-python3 -m pip install -e .
-python3 examples/list_ports.py
+uv pip install -e .
+python examples/list_ports.py
 ```
 
-安装命令会同时安装唯一的外部依赖 `pyserial`。如果不希望以可编辑模式安装，也可以执行 `python -m pip install .`。
+安装命令会同时安装唯一的外部依赖 `pyserial`。如果不希望以可编辑模式安装，也可以执行 `uv pip install .`。
 
 ## 4. 第一步：只读反馈，不运动
 
-将 `COM5` 换成实际串口：
+将 `COM8` 换成实际串口：
 
 ```bash
-python examples/read_angles.py --port COM5 --address 1 2
+python examples/read_angles.py --port COM8 --address 1 2
 ```
 
 该程序只请求多圈角度和电压，**不会使能电机，也不会发送位置或速度命令**。若超时，依次检查：
@@ -77,10 +78,11 @@ python examples/read_angles.py --port COM5 --address 1 2
 
 ## 5. 第二步：双轴小角度运动示例
 
+#### 1） 以当前为角度起点，角度前进delta
 确认机械安全后，以下命令让 yaw 相对当前位置增加 10°、pitch 减少 5°：
 
 ```bash
-python examples/two_axis_position.py --port COM5 --yaw-delta 10 --pitch-delta -5 --speed 20 --hold-time 5 --confirm
+python examples/two_axis_start_pos.py --port COM8 --yaw-delta -100 --pitch-delta -100 --speed 10 --hold-time 10 --confirm
 ```
 
 - 示例先读取当前多圈绝对角度，再计算相对目标，避免直接把当前位置误认为 0°。
@@ -91,8 +93,10 @@ python examples/two_axis_position.py --port COM5 --yaw-delta 10 --pitch-delta -5
 - `--confirm` 是人为安全确认开关；不加时程序拒绝运动。
 - 初次测试建议把两个角度变化量进一步减小，并确保随时可以切断电机电源。
 - 若只需检查上轴，可设 `--yaw-delta 0`，让下轴保持原位，只给 `--pitch-delta` 一个安全的小角度。
+#### 1） 以记录起始点作为
 
-## 6. 在自己的程序中调用
+
+## 6. 在自己的程序中调用，角度前进target
 
 只读取角度：
 
